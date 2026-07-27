@@ -100,7 +100,10 @@ def collect_all_items(max_items=MAX_ITEMS):
     with sync_playwright() as p:
         # DEBUG: brauzeri gözlə göstəririk ki, nə baş verdiyini görək.
         # Problem tapılandan sonra headless=True et.
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
