@@ -43,9 +43,9 @@ from azure_lake_client import (
 # CONFIG
 # ======================================================
 BASE_URL = "https://bina.az/alqi-satqi"
-MAX_ITEMS = 2000
+MAX_ITEMS = 500000
 SCROLL_PAUSE = 2.0
-MAX_SCROLLS_WITHOUT_NEW = 5
+MAX_SCROLLS_WITHOUT_NEW = 15
 
 
 def parse_items(raw_json):
