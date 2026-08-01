@@ -43,7 +43,7 @@ from azure_lake_client import (
 # CONFIG
 # ======================================================
 BASE_URL = "https://bina.az/alqi-satqi"
-MAX_ITEMS = 500000
+MAX_ITEMS = 10000
 SCROLL_PAUSE = 2.0
 MAX_SCROLLS_WITHOUT_NEW = 15
 
