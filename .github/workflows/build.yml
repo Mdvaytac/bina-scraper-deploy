@@ -24,4 +24,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.ACR_LOGIN_SERVER }}/bina-scraper:latest
+          tags: ${{ secrets.ACR_LOGIN_SERVER }}/bina-scraper:${{ github.sha }}
