@@ -2,25 +2,16 @@
 bina.az Scraper — Playwright ilə TAM brauzer-driven yanaşma.
 
 YENİ (bu versiyada):
-- .env faylı bu faylın da başında yüklənir (tək başına "python scrape.py"
-  ilə işə salsan belə USE_AZURE / connection string düzgün oxunsun deyə).
-- Scrape etməzdən əvvəl processed_ids metadata faylı oxunur.
-- Yalnız YENİ və ya QİYMƏTİ DƏYİŞMİŞ elanlar Bronze-a yazılır.
-  Heç nə dəyişməyən elanlar Bronze-a təkrar yazılmır (duplicate yoxdur).
-- processed_ids faylı hər run-dan sonra yenilənir (first_seen / last_seen /
-  last_updated_at / price).
-- Azure Data Lake ilə lokal fayl sistemi arasında keçid
-  azure_lake_client.py modulu vasitəsilə şəffaf şəkildə edilir
-  (USE_AZURE env dəyişəni ilə idarə olunur — sənin .env-də USE_AZURE=1).
-
-Struktur:
-    Bina.az → Scraper → processed_ids yoxlanışı → Bronze-a yaz (yalnız yeni/dəyişmiş)
+- İKİ kateqoriya scrape olunur: mənzil VƏ həyət evi (ayrı URL-lər).
+- Hər elana "property_type" sahəsi əlavə olunur.
+- Composite ID (property_type:id) istifadə olunur ki, iki kateqoriya
+  arasında ID toqquşması olmasın.
+- WATERMARK əsaslı erkən dayanma: artıq bilinən (processed_ids-də olan)
+  elanlara ardıcıl KNOWN_STREAK_LIMIT dəfə rast gəlinsə, scroll dayandırılır
+  — bu, hər saat MİNLƏRLƏ artıq-tanış elanı təkrar scroll etməkdən qorur,
+  resurs sərfiyyatını kəskin azaldır.
 """
 
-# Bu skript tək başına ("python scrape.py") işə salına bilər, ona görə
-# .env-i burda da yükləyirik — main.py-dan işə düşəndə artıq yüklənib
-# olacaq, amma bu, təhlükəsizlik üçün əlavə bir sığortadır (iki dəfə
-# çağırmaq zərər vermir).
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -42,10 +33,15 @@ from azure_lake_client import (
 # ======================================================
 # CONFIG
 # ======================================================
-BASE_URL = "https://bina.az/alqi-satqi"
+PROPERTY_SOURCES = {
+    "menzil": "https://bina.az/alqi-satqi",
+    "heyet_evi": "https://bina.az/baki/alqi-satqi/heyet-evleri",
+}
+
 MAX_ITEMS = 10000
 SCROLL_PAUSE = 2.0
 MAX_SCROLLS_WITHOUT_NEW = 15
+KNOWN_STREAK_LIMIT = 40   # ardıcıl bu qədər "artıq tanış" ID görünsə, dayan
 
 
 def parse_items(raw_json):
@@ -91,19 +87,25 @@ def parse_items(raw_json):
     return items, page_info, total_count
 
 
-def collect_all_items(max_items=MAX_ITEMS):
-    """Yalnız brauzer-driven scraping addımı — bütün görünən elanları toplayır."""
+def collect_category_items(base_url, property_type, known_ids, max_items=MAX_ITEMS,
+                            known_streak_limit=KNOWN_STREAK_LIMIT):
+    """
+    Bir kateqoriya (mənzil YA DA həyət evi) üçün scrape edir.
+
+    known_ids: composite formatda (property_type:id) əvvəlcədən bilinən ID-lərin set-i.
+    Watermark: ardıcıl `known_streak_limit` dəfə "artıq bilinən" elana rast
+    gəlinsə, deməli yeni ərazi bitib — scroll dayandırılır.
+    """
     collected = {}
     scrolls_without_new = 0
+    consecutive_known = 0
     total_count_reported = None
 
     with sync_playwright() as p:
-        # DEBUG: brauzeri gözlə göstəririk ki, nə baş verdiyini görək.
-        # Problem tapılandan sonra headless=True et.
         browser = p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
-            )
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -113,28 +115,18 @@ def collect_all_items(max_items=MAX_ITEMS):
         page = context.new_page()
 
         def handle_response(response):
-            nonlocal total_count_reported
+            nonlocal total_count_reported, consecutive_known
             if "operationName=SearchItems" not in response.url:
                 return
 
-            print(f"[DEBUG] SearchItems tutuldu, status={response.status}")
-
             if response.status != 200:
                 print(f"[XƏBƏRDARLIQ] SearchItems status={response.status}")
-                try:
-                    print(f"[XƏBƏRDARLIQ] Body: {response.text()[:300]}")
-                except Exception:
-                    pass
                 return
 
             try:
                 raw = response.json()
             except Exception as e:
                 print(f"[XƏTA] JSON parse alınmadı: {e}")
-                try:
-                    print(f"[XƏTA] Body: {response.text()[:300]}")
-                except Exception:
-                    pass
                 return
 
             items, page_info, total_count = parse_items(raw)
@@ -143,25 +135,38 @@ def collect_all_items(max_items=MAX_ITEMS):
 
             new_count = 0
             for it in items:
-                if it["id"] not in collected:
-                    collected[it["id"]] = it
-                    new_count += 1
+                composite_id = f"{property_type}:{it['id']}"
+                it["property_type"] = property_type
+                it["id"] = composite_id
+
+                if composite_id in collected:
+                    continue
+
+                collected[composite_id] = it
+                new_count += 1
+
+                if composite_id in known_ids:
+                    consecutive_known += 1
+                else:
+                    consecutive_known = 0
 
             if new_count > 0:
-                print(f"[OK] +{new_count} yeni elan (cəmi: {len(collected)} / {total_count_reported})")
-            else:
-                print("[DEBUG] Bu cavabda yeni elan yoxdur (artıq toplanmışdı)")
+                print(f"[OK][{property_type}] +{new_count} yeni (cəmi: {len(collected)} / "
+                      f"{total_count_reported}) | ardıcıl-tanış: {consecutive_known}")
 
         page.on("response", handle_response)
 
-        print("Bina.az açılır...")
-        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
-        print(f"[DEBUG] Səhifə açıldı, başlıq: {page.title()}")
-
+        print(f"[{property_type}] {base_url} açılır...")
+        page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(SCROLL_PAUSE)
-        print(f"[DEBUG] İlk gözləmədən sonra toplanan: {len(collected)}")
+        print(f"[DEBUG][{property_type}] İlk gözləmədən sonra toplanan: {len(collected)}")
 
         while len(collected) < max_items and scrolls_without_new < MAX_SCROLLS_WITHOUT_NEW:
+            if consecutive_known >= known_streak_limit:
+                print(f"[DEBUG][{property_type}] {known_streak_limit} ardıcıl tanış elan — "
+                      f"yeni ərazi bitdi, scroll dayandırılır.")
+                break
+
             before = len(collected)
             page.mouse.wheel(0, 3000)
             time.sleep(SCROLL_PAUSE)
@@ -169,11 +174,10 @@ def collect_all_items(max_items=MAX_ITEMS):
 
             if after == before:
                 scrolls_without_new += 1
-                print(f"[DEBUG] Yeni data gəlmədi ({scrolls_without_new}/{MAX_SCROLLS_WITHOUT_NEW})")
             else:
                 scrolls_without_new = 0
 
-        print(f"[DEBUG] Scroll dövrü bitdi. Yekun toplanan: {len(collected)}")
+        print(f"[DEBUG][{property_type}] Scroll bitdi. Yekun: {len(collected)}")
         browser.close()
 
     return list(collected.values())
@@ -182,23 +186,32 @@ def collect_all_items(max_items=MAX_ITEMS):
 def run_scraper(max_items=MAX_ITEMS):
     """
     Tam axın:
-      1. processed_ids-i yüklə (lazım olsa Azure-dan endir)
-      2. bina.az-ı scrape et
-      3. yeni / dəyişmiş elanları ayır (duplicate-ləri Bronze-a yazma)
-      4. yalnız yeni + dəyişmiş elanları Bronze-a yaz
-      5. processed_ids-i yenilə və saxla (lazım olsa Azure-a yüklə)
+      1. processed_ids-i yüklə
+      2. HƏR kateqoriya üçün (mənzil, həyət evi) ayrıca scrape et, watermark ilə
+      3. Nəticələri birləşdir, yeni/dəyişmiş elanları ayır
+      4. Yalnız yeni+dəyişmiş elanları Bronze-a yaz
+      5. processed_ids-i yenilə və saxla
     """
-    # 1. Metadata-nı hazırla
-    download_metadata()  # Azure rejimində no-op deyil, lokal rejimdə heç nə etmir
+    download_metadata()
     metadata_path = get_metadata_path()
     processed_df = load_processed_ids(metadata_path)
-    print(f"[DEBUG] processed_ids-də {len(processed_df)} mövcud ID var")
+    known_ids = set(processed_df["id"].astype(str)) if len(processed_df) > 0 else set()
+    print(f"[DEBUG] processed_ids-də {len(known_ids)} mövcud ID var")
 
-    # 2. Scrape et
-    all_items = collect_all_items(max_items=max_items)
-    print(f"[DEBUG] Bu run-da toplanan cəmi elan: {len(all_items)}")
+    all_items = []
+    for property_type, base_url in PROPERTY_SOURCES.items():
+        print(f"[DEBUG] === {property_type} scrape başlayır ===")
+        items = collect_category_items(
+            base_url=base_url,
+            property_type=property_type,
+            known_ids=known_ids,
+            max_items=max_items,
+        )
+        all_items.extend(items)
+        print(f"[DEBUG] {property_type}: {len(items)} elan toplandı")
 
-    # 3. Yeni / dəyişmiş / dəyişməyən elanları ayır
+    print(f"[DEBUG] Bu run-da toplanan cəmi elan (hər iki kateqoriya): {len(all_items)}")
+
     new_items, updated_items, unchanged_ids, updated_df = classify_and_update(all_items, processed_df)
     print(f"[DEBUG] Yeni: {len(new_items)} | Dəyişmiş: {len(updated_items)} | Dəyişməyən: {len(unchanged_ids)}")
 
@@ -214,13 +227,12 @@ def run_scraper(max_items=MAX_ITEMS):
             json.dump(to_write, f, ensure_ascii=False, indent=2)
 
         print(f"[TAMAMLANDI] {len(to_write)} elan Bronze-a yazıldı -> {out_path}")
-        upload_bronze_file(out_path)  # Azure rejimində yüklənir, lokalda no-op
+        upload_bronze_file(out_path)
     else:
         print("[TAMAMLANDI] Yeni və ya dəyişmiş elan yoxdur, Bronze-a yazılmadı")
 
-    # 5. processed_ids-i yadda saxla
     save_processed_ids(updated_df, metadata_path)
-    upload_metadata()  # Azure rejimində yüklənir, lokalda no-op
+    upload_metadata()
     print(f"[DEBUG] processed_ids yeniləndi, cəmi {len(updated_df)} ID izlənir")
 
     return out_path
