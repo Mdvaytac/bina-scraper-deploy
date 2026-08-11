@@ -52,11 +52,11 @@ CATEGORIES = {
 # Hər şəhərin siyahısı qısa olduğu üçün scroll axıra çatır.
 CITY_SLUGS = [None]
 
-MAX_ITEMS_PER_SOURCE = 10000
+MAX_ITEMS_PER_SOURCE = 4000
 SCROLL_PAUSE = 2.0
 MAX_SCROLLS_WITHOUT_NEW = 25
 KNOWN_STREAK_LIMIT = 40          # ardıcıl bu qədər tanış elan görünsə, dayan
-MAX_SECONDS_PER_SOURCE = 900     # bir mənbəyə maksimum 15 dəqiqə
+MAX_SECONDS_PER_SOURCE = 600     # bir mənbəyə maksimum 15 dəqiqə
 
 
 def build_sources():
