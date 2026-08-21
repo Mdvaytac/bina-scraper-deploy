@@ -1,22 +1,28 @@
 """
-bina.az Scraper — v4
+bina.az Scraper — v5
 
-v3-dən fərqlər:
-  1. FULL_ARCHIVE AÇARI. True olanda bir dəfəlik TAM YIĞIM rejimi işləyir:
-     watermark söndürülür, şəhər-şəhər gəzilir, hər şey Bronze-a yazılır.
-     False olanda əvvəlki saatlıq artımlı davranış qayıdır.
-  2. ŞƏHƏR-ŞƏHƏR BÖLGÜ. 77 min elanı bir səhifədə scroll etmək brauzerin
-     DOM-unu 5-8 GB-a çıxarır — konteynerin 4 GiB limitini aşır və çökür.
-     Hər şəhər üçün brauzer yenidən açılır, yaddaş sıfırlanır. Üstəlik
-     qısa siyahılarda scroll həqiqətən sona çatır (uzun siyahılarda sayt
-     limit qoyur).
-  3. HƏR MƏNBƏ AYRICA YAZILIR VƏ YÜKLƏNİR. 5 saatlıq run-ın 4-cü saatında
-     çökmə olsa, əvvəlki şəhərlər itmir.
-  4. ÜMUMİ VAXT BÜDCƏSİ. MAX_TOTAL_SECONDS konteynerin replica timeout-undan
-     əvvəl işi nəzarətli dayandırır — DeadlineExceeded əvəzinə təmiz bitiş.
-  5. indent=None (tam arxivdə). 40 min elanda fayl 100 MB əvəzinə ~18 MB.
+KRİTİK DƏYİŞİKLİK: scroll ləğv edildi, CURSOR PAGİNASİYASI gəldi.
 
-TAM YIĞIMDAN SONRA: FULL_ARCHIVE = False et, push et, cron-u bərpa et.
+Problem: v4-də hər mənbədən yalnız ~16 elan gəlirdi (bir GraphQL səhifəsi).
+Scroll etməyə cəhd olunurdu, amma sayt yeni sorğu göndərmirdi. bina.az
+sonsuz-scroll davranışını dəyişib və `window.scrollTo` artıq yükləməni
+tetikləmir.
+
+Həll: brauzerin ilk `SearchItems` sorğusunu tuturuq, ondan URL şablonunu
+(persistedQuery hash daxil) çıxarırıq, sonra `variables.after` sahəsinə
+cursor qoyub səhifə-səhifə özümüz çağırırıq. Sorğu brauzerin öz konteksti
+daxilində (`fetch`) gedir — cookie və header-lər avtomatik düzgün olur.
+
+Üstünlükləri:
+  * Scroll davranışından asılı deyil
+  * Səhifə render olunmur -> yaddaş sabit qalır (77 min elanda da)
+  * ~10 dəfə sürətli
+  * `first` 16-dan 40-a qaldırılıb -> daha az sorğu
+
+Cursor işləməsə (API dəyişsə), avtomatik scroll üsuluna qayıdır.
+
+LOKALDA TEST: TEST_MODE = True et, `python main.py` işlət.
+Yalnız bir mənbə, 3 səhifə çəkir, hər addımı çap edir. 30 saniyə.
 """
 
 from dotenv import load_dotenv
@@ -25,6 +31,7 @@ load_dotenv()
 import json
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs, urlencode
 from playwright.sync_api import sync_playwright
 
 from metadata_manager import load_processed_ids, save_processed_ids, classify_and_update
@@ -40,7 +47,8 @@ from azure_lake_client import (
 # REJİM
 # ======================================================
 
-FULL_ARCHIVE = True     # <<< tam yığımdan sonra False et
+TEST_MODE = False       # True: bir mənbə, 3 səhifə, Azure-a yazmır
+FULL_ARCHIVE = True     # tam yığımdan sonra False et
 
 # ======================================================
 # KONFİQURASİYA
@@ -49,42 +57,36 @@ FULL_ARCHIVE = True     # <<< tam yığımdan sonra False et
 CATEGORIES = {
     "menzil": "menziller",
     "heyet_evi": "heyet-evleri",
-    # "torpaq": "torpaq",
-    # "obyekt": "obyektler",
 }
 
+PAGE_SIZE = 40              # bir sorğuda neçə elan (sayt defoltu 16)
+REQUEST_PAUSE = 0.35        # sorğular arası fasilə — saytı yormamaq üçün
+
 if FULL_ARCHIVE:
-    # Bakı birincidir — elanların böyük hissəsi oradadır, vaxt büdcəsi
-    # tükənsə belə ən dəyərli hissə yığılmış olsun.
-    CITY_SLUGS = [
-        "baki", "sumqayit", "xirdalan", "gence", "quba", "qebele",
-        "xacmaz", "lenkeran", "seki", "samaxi", "qusar", "ismayilli",
-        "qazax", "goygol", "qax", "samux", "goranboy", "sabirabad",
-    ]
-    MAX_ITEMS_PER_SOURCE = 60000
-    MAX_SECONDS_PER_SOURCE = 1800     # şəhər başına 30 dəqiqə
-    MAX_TOTAL_SECONDS = 21600         # ümumi 6 saat (replica timeout 7 saat)
-    MAX_SCROLLS_WITHOUT_NEW = 60
-    SCROLL_PAUSE = 1.5
-    KNOWN_STREAK_LIMIT = None         # watermark söndürülüb
-    WRITE_ALL = True                  # dəyişməyən elanlar da yazılır
+    CITY_SLUGS = [None]                # cursor ilə ölkə üzrə tam gəzmək olur
+    MAX_ITEMS_PER_SOURCE = 80000
+    MAX_SECONDS_PER_SOURCE = 3600
+    MAX_TOTAL_SECONDS = 21600
+    KNOWN_STREAK_LIMIT = None          # watermark söndürülüb
+    WRITE_ALL = True
     JSON_INDENT = None
-    PROGRESS_EVERY = 500
+    PROGRESS_EVERY = 1000
 else:
-    CITY_SLUGS = [None]               # ölkə üzrə tək siyahı
-    MAX_ITEMS_PER_SOURCE = 4000
-    MAX_SECONDS_PER_SOURCE = 600
+    CITY_SLUGS = [None]
+    MAX_ITEMS_PER_SOURCE = 6000
+    MAX_SECONDS_PER_SOURCE = 900
     MAX_TOTAL_SECONDS = 3000
-    MAX_SCROLLS_WITHOUT_NEW = 25
-    SCROLL_PAUSE = 2.0
-    KNOWN_STREAK_LIMIT = 40           # ardıcıl tanış elan sayı
-    WRITE_ALL = False                 # yalnız yeni + dəyişmiş
+    KNOWN_STREAK_LIMIT = 200           # ardıcıl tanış elan sayı
+    WRITE_ALL = False
     JSON_INDENT = 2
-    PROGRESS_EVERY = 200
+    PROGRESS_EVERY = 400
+
+# Scroll fallback parametrləri (yalnız cursor işləməsə)
+SCROLL_PAUSE = 2.0
+MAX_SCROLLS_WITHOUT_NEW = 20
 
 
 def build_sources():
-    """CATEGORIES × CITY_SLUGS kombinasiyalarından mənbə siyahısı qurur."""
     sources = []
     for property_type, slug in CATEGORIES.items():
         for city in CITY_SLUGS:
@@ -103,12 +105,12 @@ def build_sources():
 # ======================================================
 
 def parse_items(raw_json):
-    """GraphQL SearchItems cavabından lazımi sahələri çıxarır."""
     items = []
-    connection = raw_json.get("data", {}).get("itemsConnection", {})
+    data = raw_json.get("data") or {}
+    connection = data.get("itemsConnection") or {}
 
-    for edge in connection.get("edges", []):
-        node = edge.get("node", {})
+    for edge in connection.get("edges", []) or []:
+        node = edge.get("node") or {}
         area = node.get("area") or {}
         price = node.get("price") or {}
         city = node.get("city") or {}
@@ -147,27 +149,190 @@ def parse_items(raw_json):
             "path": node.get("path"),
         })
 
-    return items, connection.get("pageInfo", {}), connection.get("totalCount")
+    page_info = connection.get("pageInfo") or {}
+    return items, page_info, connection.get("totalCount")
 
 
 # ======================================================
-# SCRAPING
+# CURSOR PAGİNASİYASI
+# ======================================================
+
+FETCH_JS = """
+async (u) => {
+  const r = await fetch(u, { credentials: 'include',
+                             headers: { 'accept': 'application/json' } });
+  if (!r.ok) return { __err: r.status };
+  return await r.json();
+}
+"""
+
+
+def build_query_url(template_url, variables, extensions_raw):
+    """Tutulmuş sorğu şablonundan yeni cursor ilə URL qurur."""
+    p = urlparse(template_url)
+    params = {
+        "operationName": "SearchItems",
+        "variables": json.dumps(variables, separators=(",", ":")),
+    }
+    if extensions_raw:
+        params["extensions"] = extensions_raw
+    return f"{p.scheme}://{p.netloc}{p.path}?{urlencode(params)}"
+
+
+def collect_via_cursor(page, template_url, label, deadline, known_ids,
+                       max_items, max_seconds):
+    """
+    Tutulmuş SearchItems sorğusunu cursor ilə səhifə-səhifə təkrarlayır.
+    Uğursuz olsa None qaytarır -> çağıran tərəf scroll-a keçir.
+    """
+    p = urlparse(template_url)
+    q = parse_qs(p.query)
+
+    try:
+        variables = json.loads(q["variables"][0])
+    except Exception as e:
+        print(f"[{label}] Cursor: variables oxunmadı ({e}) -> scroll-a keçilir")
+        return None
+
+    extensions_raw = q.get("extensions", [None])[0]
+    variables["first"] = PAGE_SIZE
+
+    collected = {}
+    cursor = None
+    total = None
+    consecutive_known = 0
+    page_no = 0
+    last_progress = 0
+    started = time.time()
+
+    while True:
+        if len(collected) >= max_items:
+            print(f"[{label}] Element limitinə çatdı ({max_items})")
+            break
+        if time.time() - started > max_seconds:
+            print(f"[{label}] Mənbə vaxt limiti ({max_seconds}s)")
+            break
+        if deadline and time.time() > deadline:
+            print(f"[{label}] Ümumi vaxt büdcəsi bitdi")
+            break
+        if KNOWN_STREAK_LIMIT is not None and consecutive_known >= KNOWN_STREAK_LIMIT:
+            print(f"[{label}] {KNOWN_STREAK_LIMIT} ardıcıl tanış elan (watermark)")
+            break
+
+        if cursor:
+            variables["after"] = cursor
+        url = build_query_url(template_url, variables, extensions_raw)
+
+        try:
+            raw = page.evaluate(FETCH_JS, url)
+        except Exception as e:
+            print(f"[{label}] Cursor fetch xətası: {str(e)[:100]}")
+            return None if page_no == 0 else list(collected.values())
+
+        if not isinstance(raw, dict) or raw.get("__err"):
+            code = raw.get("__err") if isinstance(raw, dict) else "?"
+            print(f"[{label}] Cursor HTTP {code}")
+            return None if page_no == 0 else list(collected.values())
+
+        if raw.get("errors"):
+            msg = str(raw["errors"])[:150]
+            print(f"[{label}] GraphQL xətası: {msg}")
+            return None if page_no == 0 else list(collected.values())
+
+        items, page_info, total_count = parse_items(raw)
+        if total_count is not None:
+            total = total_count
+
+        page_no += 1
+
+        if page_no == 1 and not items:
+            print(f"[{label}] Cursor: ilk səhifə boş -> scroll-a keçilir")
+            return None
+
+        new_count = 0
+        for it in items:
+            iid = it.get("id")
+            if iid is None or iid in collected:
+                continue
+            it["property_type"] = None      # çağıran tərəf dolduracaq
+            collected[iid] = it
+            new_count += 1
+            if KNOWN_STREAK_LIMIT is not None:
+                if str(iid) in known_ids:
+                    consecutive_known += 1
+                else:
+                    consecutive_known = 0
+
+        if len(collected) - last_progress >= PROGRESS_EVERY:
+            last_progress = len(collected)
+            pct = (100 * len(collected) / total) if total else 0
+            print(f"[{label}] {len(collected)} / {total} ({pct:.1f}%) "
+                  f"| səhifə {page_no}")
+
+        has_next = page_info.get("hasNextPage")
+        cursor = page_info.get("endCursor")
+
+        if TEST_MODE and page_no >= 3:
+            print(f"[{label}] TEST_MODE: 3 səhifədən sonra dayanıldı")
+            break
+
+        if has_next is False or not cursor:
+            print(f"[{label}] Siyahının sonu (səhifə {page_no})")
+            break
+
+        if new_count == 0:
+            print(f"[{label}] Yeni elan gəlmədi, dayanılır (səhifə {page_no})")
+            break
+
+        time.sleep(REQUEST_PAUSE)
+
+    print(f"[{label}] CURSOR NƏTİCƏSİ: {len(collected)} / {total} elan, "
+          f"{page_no} sorğu, {round(time.time() - started, 1)}s")
+    return list(collected.values())
+
+
+# ======================================================
+# SCROLL FALLBACK
+# ======================================================
+
+def collect_via_scroll(page, label, collected_from_listener, max_items, max_seconds):
+    """Cursor işləməsə köhnə üsul. collected_from_listener response dinləyicisi
+    tərəfindən doldurulur."""
+    print(f"[{label}] SCROLL üsuluna keçilir...")
+    started = time.time()
+    scrolls_without_new = 0
+
+    while len(collected_from_listener) < max_items and \
+          scrolls_without_new < MAX_SCROLLS_WITHOUT_NEW:
+        if time.time() - started > max_seconds:
+            break
+        before = len(collected_from_listener)
+        try:
+            page.evaluate(
+                "window.scrollBy(0, document.body.scrollHeight * 0.8)")
+            page.keyboard.press("End")
+        except Exception:
+            break
+        time.sleep(SCROLL_PAUSE)
+        if len(collected_from_listener) == before:
+            scrolls_without_new += 1
+        else:
+            scrolls_without_new = 0
+
+    print(f"[{label}] SCROLL NƏTİCƏSİ: {len(collected_from_listener)} elan")
+    return list(collected_from_listener.values())
+
+
+# ======================================================
+# BİR MƏNBƏ
 # ======================================================
 
 def collect_source_items(source, known_ids, deadline=None):
-    """
-    Bir mənbəni (kateqoriya + şəhər) scrape edir.
-    known_ids: watermark üçün mövcud ID-lər. FULL_ARCHIVE-də istifadə olunmur.
-    deadline: ümumi vaxt büdcəsinin bitmə anı (time.time() dəyəri).
-    """
     property_type = source["property_type"]
     label = f"{property_type}/{source['city_slug']}"
 
-    collected = {}
-    scrolls_without_new = 0
-    consecutive_known = 0
-    total_count_reported = None
-    last_progress = 0
+    captured = {"url": None}
+    scroll_bucket = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -182,47 +347,24 @@ def collect_source_items(source, known_ids, deadline=None):
         )
         page = context.new_page()
 
-        def handle_response(response):
-            nonlocal total_count_reported, consecutive_known, last_progress
-            if "operationName=SearchItems" not in response.url:
-                return
-            if response.status != 200:
-                print(f"[XƏBƏRDARLIQ][{label}] SearchItems status={response.status}")
+        def on_request(req):
+            if captured["url"] is None and "operationName=SearchItems" in req.url:
+                captured["url"] = req.url
+
+        def on_response(resp):
+            # yalnız scroll fallback üçün lazımdır
+            if "operationName=SearchItems" not in resp.url or resp.status != 200:
                 return
             try:
-                raw = response.json()
-            except Exception as e:
-                print(f"[XƏTA][{label}] JSON parse alınmadı: {e}")
+                items, _pi, _tc = parse_items(resp.json())
+            except Exception:
                 return
-
-            items, _page_info, total_count = parse_items(raw)
-            if total_count is not None:
-                total_count_reported = total_count
-
             for it in items:
-                item_id = it.get("id")
-                if item_id is None or item_id in collected:
-                    continue
+                if it.get("id") and it["id"] not in scroll_bucket:
+                    scroll_bucket[it["id"]] = it
 
-                it["property_type"] = property_type
-                collected[item_id] = it
-
-                if KNOWN_STREAK_LIMIT is not None:
-                    if str(item_id) in known_ids:
-                        consecutive_known += 1
-                    else:
-                        consecutive_known = 0
-
-            if len(collected) - last_progress >= PROGRESS_EVERY:
-                last_progress = len(collected)
-                pct = (100 * len(collected) / total_count_reported
-                       if total_count_reported else 0)
-                extra = (f" | ardıcıl-tanış: {consecutive_known}"
-                         if KNOWN_STREAK_LIMIT is not None else "")
-                print(f"[{label}] {len(collected)} / {total_count_reported} "
-                      f"({pct:.1f}%){extra}")
-
-        page.on("response", handle_response)
+        page.on("request", on_request)
+        page.on("response", on_response)
 
         print(f"\n[{label}] {source['url']} açılır...")
         try:
@@ -231,54 +373,35 @@ def collect_source_items(source, known_ids, deadline=None):
             print(f"[XƏTA][{label}] Səhifə açılmadı: {str(e)[:120]}")
             browser.close()
             return []
-        time.sleep(SCROLL_PAUSE)
 
-        started = time.time()
-        stop_reason = "scroll bitdi"
-
-        while len(collected) < MAX_ITEMS_PER_SOURCE and \
-              scrolls_without_new < MAX_SCROLLS_WITHOUT_NEW:
-
-            if KNOWN_STREAK_LIMIT is not None and \
-               consecutive_known >= KNOWN_STREAK_LIMIT:
-                stop_reason = f"{KNOWN_STREAK_LIMIT} ardıcıl tanış elan (watermark)"
+        # ilk GraphQL sorğusunun gəlməsini gözlə
+        for _ in range(30):
+            if captured["url"]:
                 break
+            time.sleep(0.5)
 
-            if time.time() - started > MAX_SECONDS_PER_SOURCE:
-                stop_reason = f"mənbə vaxt limiti ({MAX_SECONDS_PER_SOURCE}s)"
-                break
+        if not captured["url"]:
+            print(f"[{label}] !!! SearchItems sorğusu tutulmadı. "
+                  f"URL səhv ola bilər və ya səhifə boşdur.")
+            browser.close()
+            return []
 
-            if deadline and time.time() > deadline:
-                stop_reason = "ümumi vaxt büdcəsi bitdi"
-                break
+        print(f"[{label}] Sorğu şablonu tutuldu.")
 
-            before = len(collected)
-            try:
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            except Exception as e:
-                stop_reason = f"scroll xətası: {str(e)[:60]}"
-                break
-            time.sleep(SCROLL_PAUSE)
+        result = collect_via_cursor(
+            page, captured["url"], label, deadline, known_ids,
+            MAX_ITEMS_PER_SOURCE, MAX_SECONDS_PER_SOURCE)
 
-            if len(collected) == before:
-                scrolls_without_new += 1
-                time.sleep(1.0)
-            else:
-                scrolls_without_new = 0
-
-        elapsed = round(time.time() - started, 1)
-        got = len(collected)
-        total = total_count_reported or 0
-        print(f"[{label}] BİTDİ: {got} / {total} elan, {elapsed}s — {stop_reason}")
-
-        if FULL_ARCHIVE and total and got < total * 0.6:
-            print(f"[{label}] !!! Saytda {total} elan var, yalnız {got} alındı.")
-            print(f"[{label}] !!! Scroll limitə çatıb — bu şəhəri otaq sayına "
-                  f"görə də bölmək lazım ola bilər.")
+        if result is None:
+            result = collect_via_scroll(
+                page, label, scroll_bucket,
+                MAX_ITEMS_PER_SOURCE, MAX_SECONDS_PER_SOURCE)
 
         browser.close()
 
-    return list(collected.values())
+    for it in result:
+        it["property_type"] = property_type
+    return result
 
 
 # ======================================================
@@ -287,39 +410,42 @@ def collect_source_items(source, known_ids, deadline=None):
 
 def run_scraper():
     mode = "TAM ARXİV" if FULL_ARCHIVE else "SAATLIQ ARTIMLI"
-    print(f"=== REJİM: {mode} ===")
+    print(f"=== REJİM: {mode}{' | TEST' if TEST_MODE else ''} ===")
+    print(f"=== ÜSUL: cursor paginasiyası (səhifə ölçüsü {PAGE_SIZE}) ===")
 
-    download_metadata()
-    metadata_path = get_metadata_path()
-    processed_df = load_processed_ids(metadata_path)
-    known_ids = set(processed_df["id"].astype(str)) if len(processed_df) > 0 else set()
-    print(f"[DEBUG] processed_ids-də {len(known_ids)} mövcud ID var")
+    if TEST_MODE:
+        sources = build_sources()[:1]
+        known_ids, processed_df = set(), None
+    else:
+        download_metadata()
+        metadata_path = get_metadata_path()
+        processed_df = load_processed_ids(metadata_path)
+        known_ids = (set(processed_df["id"].astype(str))
+                     if len(processed_df) > 0 else set())
+        print(f"[DEBUG] processed_ids-də {len(known_ids)} ID var")
+        sources = build_sources()
 
-    scraped_at = datetime.now(timezone.utc).isoformat()
-    bronze_dir = get_bronze_dir()
-    sources = build_sources()
-    print(f"[DEBUG] {len(sources)} mənbə scrape ediləcək")
+    print(f"[DEBUG] {len(sources)} mənbə\n")
 
     t0 = time.time()
     deadline = t0 + MAX_TOTAL_SECONDS
+    scraped_at = datetime.now(timezone.utc).isoformat()
+    bronze_dir = get_bronze_dir()
 
-    all_items = []
-    seen = set()
-    written_files = []
+    all_items, seen, written = [], set(), []
 
     for i, source in enumerate(sources, 1):
         if time.time() > deadline:
-            print(f"\n[DAYANDI] Ümumi vaxt büdcəsi bitdi. "
-                  f"{i - 1}/{len(sources)} mənbə tamamlandı.")
+            print(f"\n[DAYANDI] Vaxt büdcəsi bitdi ({i-1}/{len(sources)})")
             break
 
-        print(f"\n[{i}/{len(sources)}] === {source['property_type']} / "
+        print(f"[{i}/{len(sources)}] === {source['property_type']} / "
               f"{source['city_slug']} ===")
 
         try:
             items = collect_source_items(source, known_ids, deadline)
         except Exception as e:
-            print(f"[XƏTA] {source['city_slug']} uğursuz oldu: {str(e)[:150]}")
+            print(f"[XƏTA] {source['city_slug']}: {str(e)[:150]}")
             continue
 
         fresh = []
@@ -330,10 +456,15 @@ def run_scraper():
             seen.add(key)
             it["scraped_at"] = scraped_at
             fresh.append(it)
-
         all_items.extend(fresh)
 
-        # TAM ARXİV: hər mənbə bitən kimi yaz və yüklə
+        if TEST_MODE:
+            print(f"\n[TEST] {len(fresh)} elan yığıldı. Nümunə:")
+            for it in fresh[:3]:
+                print(f"   {it['id']} | {it['district']} | {it['rooms']} otaq "
+                      f"| {it['area_value']} {it['area_unit']} | {it['price']}")
+            continue
+
         if WRITE_ALL and fresh:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             name = (f"listings_full_{source['property_type']}_"
@@ -341,28 +472,30 @@ def run_scraper():
             out_path = bronze_dir / name
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(fresh, f, ensure_ascii=False, indent=JSON_INDENT)
-            size_mb = round(out_path.stat().st_size / 1024 / 1024, 2)
-            print(f"[YAZILDI] {len(fresh)} elan -> {name} ({size_mb} MB)")
-
+            mb = round(out_path.stat().st_size / 1024 / 1024, 2)
+            print(f"[YAZILDI] {len(fresh)} elan -> {name} ({mb} MB)")
             try:
                 upload_bronze_file(out_path)
-                written_files.append(name)
+                written.append(name)
             except Exception as e:
-                print(f"[XƏTA] Yükləmə alınmadı: {str(e)[:120]}")
-                print(f"[QEYD] Fayl lokalda qalıb: {out_path}")
+                print(f"[XƏTA] Yükləmə: {str(e)[:120]}")
 
-        print(f"[DEBUG] Cəmi unikal: {len(all_items)} | "
-              f"keçən vaxt: {round((time.time() - t0) / 60, 1)} dəq")
+        print(f"[DEBUG] Cəmi: {len(all_items)} | "
+              f"{round((time.time()-t0)/60, 1)} dəq\n")
 
-    print(f"\n[DEBUG] Bu run-da unikal elan: {len(all_items)}")
+    if TEST_MODE:
+        print(f"\n=== TEST BİTDİ: {len(all_items)} elan ===")
+        print("Rəqəm 100-dən çoxdursa, cursor işləyir. "
+              "16 və ya 40 qalıbsa, mənə log-u göndər.")
+        return []
 
-    new_items, updated_items, unchanged_ids, updated_df = classify_and_update(
-        all_items, processed_df
-    )
+    print(f"\n[DEBUG] Unikal elan: {len(all_items)}")
+
+    new_items, updated_items, unchanged, updated_df = classify_and_update(
+        all_items, processed_df)
     print(f"[DEBUG] Yeni: {len(new_items)} | Dəyişmiş: {len(updated_items)} | "
-          f"Dəyişməyən: {len(unchanged_ids)}")
+          f"Dəyişməyən: {len(unchanged)}")
 
-    # SAATLIQ REJİM: yalnız yeni + dəyişmiş, tək fayl
     if not WRITE_ALL:
         to_write = new_items + updated_items
         if to_write:
@@ -370,29 +503,26 @@ def run_scraper():
             out_path = bronze_dir / f"listings_{ts}.json"
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(to_write, f, ensure_ascii=False, indent=JSON_INDENT)
-            print(f"[TAMAMLANDI] {len(to_write)} elan Bronze-a yazıldı")
+            print(f"[TAMAMLANDI] {len(to_write)} elan yazıldı")
             upload_bronze_file(out_path)
-            written_files.append(out_path.name)
+            written.append(out_path.name)
         else:
-            print("[TAMAMLANDI] Yeni və ya dəyişmiş elan yoxdur")
+            print("[TAMAMLANDI] Yeni elan yoxdur")
 
     save_processed_ids(updated_df, metadata_path)
     try:
         upload_metadata()
     except Exception as e:
-        print(f"[XƏTA] Metadata yüklənmədi: {str(e)[:120]}")
-    print(f"[DEBUG] processed_ids: {len(updated_df)} ID izlənir")
+        print(f"[XƏTA] Metadata: {str(e)[:120]}")
 
-    # Zaman oxunun genişliyi — trend qrafiklərinin əsası budur
     dates = sorted(it["updated_at"][:10] for it in all_items
                    if it.get("updated_at"))
     if dates:
         print(f"\n[NƏTİCƏ] updated_at aralığı: {dates[0]} → {dates[-1]}")
+    print(f"[NƏTİCƏ] {len(written)} fayl yükləndi")
+    print(f"[NƏTİCƏ] Ümumi vaxt: {round((time.time()-t0)/60, 1)} dəqiqə")
 
-    print(f"[NƏTİCƏ] {len(written_files)} fayl Bronze-a yükləndi")
-    print(f"[NƏTİCƏ] Ümumi vaxt: {round((time.time() - t0) / 60, 1)} dəqiqə")
-
-    return written_files
+    return written
 
 
 if __name__ == "__main__":
