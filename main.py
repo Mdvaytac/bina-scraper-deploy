@@ -54,7 +54,7 @@ MAX_ITEMS_PER_SOURCE = 60000      # praktiki olaraq limitsiz
 MAX_SECONDS_PER_SOURCE = 21600    # 6 saat
 MAX_SCROLLS_WITHOUT_NEW = 60      # şəbəkə ləngiməsinə dözümlü
 SCROLL_PAUSE = 1.5
-PROGRESS_EVERY = 500              # neçə yeni elandan bir vəziyyət yaz
+PROGRESS_EVERY = 1000              # neçə yeni elandan bir vəziyyət yaz
  
  
 def build_sources():
